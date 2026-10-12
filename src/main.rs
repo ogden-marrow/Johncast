@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -12,6 +13,8 @@ struct Podcast {
     url: String,
     title: String,
     listened: Vec<String>,
+    #[serde(default)]
+    resume: BTreeMap<String, u64>, // episode id -> seconds
 }
 
 fn settings_path() -> PathBuf {
@@ -68,6 +71,30 @@ fn episode_id(item: &rss::Item) -> String {
         .unwrap_or_default()
 }
 
+/// Plays with mpv from `start` seconds. Returns the position to resume from,
+/// or None if the episode finished (mpv saves no position then).
+fn play(url: &str, start: u64) -> io::Result<Option<u64>> {
+    let dir = std::env::temp_dir().join(format!("johncast-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let status = std::process::Command::new("mpv")
+        .args(["--no-video", "--save-position-on-quit", "--watch-later-options=start"])
+        .arg(format!("--watch-later-dir={}", dir.display()))
+        .arg(format!("--start={start}"))
+        .arg(url)
+        .status();
+    let pos = std::fs::read_dir(&dir)?
+        .flatten()
+        .filter_map(|f| std::fs::read_to_string(f.path()).ok())
+        .find_map(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("start="))
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .map(|v| v as u64);
+    let _ = std::fs::remove_dir_all(&dir);
+    status.map(|_| pos)
+}
+
 fn episodes(settings: &mut Settings, idx: usize) {
     let channel = match fetch(&settings.podcasts[idx].url) {
         Ok(c) => c,
@@ -101,9 +128,19 @@ fn episodes(settings: &mut Settings, idx: usize) {
                 listened.push(id);
                 save(settings);
             }
-            if let Err(e) = std::process::Command::new("mpv").args(["--no-video", url]).status() {
-                println!("could not run mpv: {e}");
+            let id = episode_id(item);
+            let start = settings.podcasts[idx].resume.get(&id).copied().unwrap_or(0);
+            match play(url, start) {
+                Ok(Some(pos)) => {
+                    settings.podcasts[idx].resume.insert(id, pos);
+                    println!("resume saved at {}:{:02}", pos / 60, pos % 60);
+                }
+                Ok(None) => {
+                    settings.podcasts[idx].resume.remove(&id);
+                }
+                Err(e) => println!("could not run mpv: {e}"),
             }
+            save(settings);
             continue;
         }
         match cmd.parse::<usize>() {
@@ -144,6 +181,7 @@ fn main() {
                             url,
                             title: c.title().to_string(),
                             listened: vec![],
+                            resume: BTreeMap::new(),
                         });
                         save(&settings);
                     }
