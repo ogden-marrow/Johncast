@@ -100,7 +100,8 @@ fn episodes(settings: &mut Settings, idx: usize) {
         Ok(c) => c,
         Err(e) => return println!("could not load feed: {e}"),
     };
-    let items = channel.items();
+    // feeds list newest first; show oldest first so episode 1 is the first episode
+    let items: Vec<&rss::Item> = channel.items().iter().rev().collect();
     loop {
         println!("\n== {} ==", settings.podcasts[idx].title);
         let w = items.len().to_string().len();
