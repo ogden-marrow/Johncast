@@ -95,16 +95,14 @@ fn episodes(settings: &mut Settings, idx: usize) {
                 println!("no audio in this episode");
                 continue;
             };
-            match std::process::Command::new("mpv").args(["--no-video", url]).status() {
-                Ok(_) => {
-                    let id = episode_id(item);
-                    let listened = &mut settings.podcasts[idx].listened;
-                    if !listened.contains(&id) {
-                        listened.push(id);
-                        save(settings);
-                    }
-                }
-                Err(e) => println!("could not run mpv: {e}"),
+            let id = episode_id(item);
+            let listened = &mut settings.podcasts[idx].listened;
+            if !listened.contains(&id) {
+                listened.push(id);
+                save(settings);
+            }
+            if let Err(e) = std::process::Command::new("mpv").args(["--no-video", url]).status() {
+                println!("could not run mpv: {e}");
             }
             continue;
         }
