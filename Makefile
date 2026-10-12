@@ -4,7 +4,8 @@ DESTDIR ?=
 all:
 	cargo build --release --locked
 
-install: all
+install:
+	@test -f target/release/johncast || { echo "run 'make' first (as your user, not root)"; exit 1; }
 	install -Dm755 target/release/johncast $(DESTDIR)$(PREFIX)/bin/johncast
 
 uninstall:
