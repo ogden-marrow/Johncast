@@ -85,9 +85,28 @@ fn episodes(settings: &mut Settings, idx: usize) {
                 item.title().unwrap_or("(untitled)")
             );
         }
-        let Some(cmd) = prompt("\n[number] toggle listened, [b] back: ") else { return };
+        let Some(cmd) = prompt("\n[number] toggle listened, [p number] play, [b] back: ") else { return };
         if cmd == "b" {
             return;
+        }
+        if let Some(n) = cmd.strip_prefix('p').and_then(|n| n.trim().parse::<usize>().ok()) {
+            let Some(item) = items.get(n.wrapping_sub(1)) else { println!("?"); continue };
+            let Some(url) = item.enclosure().map(|e| e.url()) else {
+                println!("no audio in this episode");
+                continue;
+            };
+            match std::process::Command::new("mpv").args(["--no-video", url]).status() {
+                Ok(_) => {
+                    let id = episode_id(item);
+                    let listened = &mut settings.podcasts[idx].listened;
+                    if !listened.contains(&id) {
+                        listened.push(id);
+                        save(settings);
+                    }
+                }
+                Err(e) => println!("could not run mpv: {e}"),
+            }
+            continue;
         }
         match cmd.parse::<usize>() {
             Ok(n) if (1..=items.len()).contains(&n) => {
