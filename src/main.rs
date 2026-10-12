@@ -42,6 +42,7 @@ struct App {
     podcasts: ListState,
     episodes: ListState,
     input: Option<String>, // Some while typing a feed URL
+    typed: String,         // digits typed to jump to a list number
     confirm_remove: bool,
     msg: String,
     quit: bool,
@@ -173,23 +174,38 @@ fn play(url: &str, start: u64) -> io::Result<Option<u64>> {
     status.map(|_| pos)
 }
 
-/// Moves a list selection for navigation keys; returns false for other keys.
-fn nav(state: &mut ListState, len: usize, code: KeyCode) -> bool {
-    if len == 0 {
-        return false;
+/// Handles list navigation: arrows wrap around, typing digits jumps to that number.
+/// Returns true if the key was consumed.
+fn nav(state: &mut ListState, typed: &mut String, len: usize, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char(c) if c.is_ascii_digit() && len > 0 => {
+            typed.push(c);
+            match typed.parse::<usize>() {
+                Ok(n) if (1..=len).contains(&n) => state.select(Some(n - 1)),
+                _ => {
+                    typed.pop();
+                }
+            }
+            true
+        }
+        KeyCode::Backspace if !typed.is_empty() => {
+            typed.pop();
+            if let Ok(n) = typed.parse::<usize>() {
+                state.select(Some(n - 1));
+            }
+            true
+        }
+        KeyCode::Up | KeyCode::Down if len > 0 => {
+            typed.clear();
+            let cur = state.selected().unwrap_or(0);
+            state.select(Some(if code == KeyCode::Up { (cur + len - 1) % len } else { (cur + 1) % len }));
+            true
+        }
+        _ => {
+            typed.clear();
+            false
+        }
     }
-    let cur = state.selected().unwrap_or(0);
-    let new = match code {
-        KeyCode::Up | KeyCode::Char('k') => cur.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => (cur + 1).min(len - 1),
-        KeyCode::PageUp => cur.saturating_sub(10),
-        KeyCode::PageDown => (cur + 10).min(len - 1),
-        KeyCode::Home | KeyCode::Char('g') => 0,
-        KeyCode::End | KeyCode::Char('G') => len - 1,
-        _ => return false,
-    };
-    state.select(Some(new));
-    true
 }
 
 impl App {
@@ -205,6 +221,7 @@ impl App {
             podcasts,
             episodes: ListState::default(),
             input: None,
+            typed: String::new(),
             confirm_remove: false,
             msg: String::new(),
             quit: false,
@@ -220,10 +237,17 @@ impl App {
         let keys = match (&self.screen, self.input.is_some(), self.confirm_remove) {
             (_, true, _) => "Enter save   Esc cancel",
             (_, _, true) => "Remove this podcast?   y yes   any other key cancels",
-            (Screen::Podcasts, ..) => "↑↓ move   Enter open   a add feed   d remove   q quit",
-            (Screen::Episodes { .. }, ..) => "↑↓ move   Enter play   Space mark listened   Esc back",
+            (Screen::Podcasts, ..) => "↑↓ or type a number   Enter open   a add feed   d remove   q quit",
+            (Screen::Episodes { .. }, ..) => "↑↓ or type a number   Enter play   Space mark listened   Esc back",
         };
-        let help_text = if self.msg.is_empty() { keys } else { &self.msg };
+        let typed_hint = format!("Go to: {}▏  (Enter to select)", self.typed);
+        let help_text = if !self.msg.is_empty() {
+            &self.msg
+        } else if !self.typed.is_empty() {
+            &typed_hint
+        } else {
+            keys
+        };
         let help_style = if self.msg.is_empty() { dim } else { Style::default().fg(Color::Yellow) };
         f.render_widget(Paragraph::new(help_text).style(help_style), help);
 
@@ -380,14 +404,14 @@ impl App {
 
     fn key_podcasts(&mut self, terminal: &mut DefaultTerminal, code: KeyCode) -> io::Result<()> {
         let len = self.settings.podcasts.len();
-        if nav(&mut self.podcasts, len, code) {
+        if nav(&mut self.podcasts, &mut self.typed, len, code) {
             return Ok(());
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('a') => self.input = Some(String::new()),
             KeyCode::Char('d') if len > 0 => self.confirm_remove = true,
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Enter | KeyCode::Right => {
                 let Some(idx) = self.podcasts.selected() else { return Ok(()) };
                 self.redraw(terminal, "Loading episodes…")?;
                 match fetch(&self.settings.podcasts[idx].url) {
@@ -420,11 +444,11 @@ impl App {
     fn key_episodes(&mut self, terminal: &mut DefaultTerminal, code: KeyCode) -> io::Result<()> {
         let Screen::Episodes { idx, eps } = &self.screen else { return Ok(()) };
         let idx = *idx;
-        if nav(&mut self.episodes, eps.len(), code) {
+        if nav(&mut self.episodes, &mut self.typed, eps.len(), code) {
             return Ok(());
         }
         match code {
-            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => {
                 self.screen = Screen::Podcasts;
             }
             KeyCode::Char(' ') => {
@@ -438,7 +462,7 @@ impl App {
                 }
                 save(&self.settings);
             }
-            KeyCode::Enter | KeyCode::Char('p') => {
+            KeyCode::Enter => {
                 let Some(e) = self.episodes.selected().and_then(|i| eps.get(i)) else { return Ok(()) };
                 let Some(url) = e.url.clone() else {
                     self.msg = "This episode has no audio.".into();
