@@ -103,10 +103,11 @@ fn episodes(settings: &mut Settings, idx: usize) {
     let items = channel.items();
     loop {
         println!("\n== {} ==", settings.podcasts[idx].title);
+        let w = items.len().to_string().len();
         for (i, item) in items.iter().enumerate() {
             let done = settings.podcasts[idx].listened.contains(&episode_id(item));
             println!(
-                "{:>3}. [{}] {}",
+                "{:>w$}. [{}] {}",
                 i + 1,
                 if done { 'x' } else { ' ' },
                 item.title().unwrap_or("(untitled)")
@@ -164,8 +165,9 @@ fn main() {
     let mut settings = load();
     loop {
         println!("\n== Johncast ==");
+        let w = settings.podcasts.len().to_string().len();
         for (i, p) in settings.podcasts.iter().enumerate() {
-            println!("{:>3}. {}", i + 1, p.title);
+            println!("{:>w$}. {}", i + 1, p.title);
         }
         let Some(cmd) = prompt("\n[number] open, [a] add feed, [r] remove, [q] quit: ") else { return };
         match cmd.as_str() {
