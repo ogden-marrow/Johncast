@@ -1,4 +1,5 @@
 use ratatui::crossterm::event::{self, Event, KeyCode as K, KeyEventKind::Press, KeyModifiers};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::{prelude::*, widgets::*};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap as Map, process::Command};
@@ -9,6 +10,9 @@ struct Settings { podcasts: Vec<Podcast>, sync: bool, cookie: String }
 #[derive(Serialize, Deserialize, Default)]
 struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64> }
 type Ep = (String, String, Option<String>);
+static INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct Restore;
+impl Drop for Restore { fn drop(&mut self) { ratatui::restore(); } }
 struct Oc { id: String, url: String, played: bool, progress: u64 }
 
 fn file() -> std::path::PathBuf {
@@ -26,6 +30,16 @@ fn save(s: &Settings) {
 }
 fn fetch(url: &str) -> Result<rss::Channel, Box<dyn std::error::Error>> {
     Ok(rss::Channel::read_from(&ureq::get(url).call()?.body_mut().read_to_vec()?[..])?)
+}
+
+fn shell_out<R>(t: &mut ratatui::DefaultTerminal, f: impl FnOnce() -> R) -> R {
+    let _ = disable_raw_mode();
+    println!("\x1b[2J\x1b[H\x1b[?25h");
+    let r = f();
+    let _ = enable_raw_mode();
+    print!("\x1b[2J\x1b[H");
+    if let Ok(fresh) = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())) { *t = fresh; }
+    r
 }
 
 fn between<'a>(s: &'a str, a: &str, b: &str) -> &'a str {
@@ -51,8 +65,10 @@ fn login() -> Option<String> {
     println!("\nScan with your iPhone camera to log in with the Overcast app (Ctrl-C cancels):\n");
     println!("{}", qr.render::<qrcode::render::unicode::Dense1x2>().dark_color(Light).light_color(Dark).build());
     println!("No camera? Open https://overcast.fm/main/login_app?t={token}&l=browser on your phone.");
+    INT.store(false, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..300 {
         std::thread::sleep(std::time::Duration::from_secs(1));
+        if INT.load(std::sync::atomic::Ordering::SeqCst) { return None }
         let sent = ureq::post("https://overcast.fm/main/login_qr_verify").header("Cookie", cookie(&jar)).send_form([("token", token.as_str()), ("then", "podcasts")]);
         let Ok(mut r) = sent else { continue };
         keep(&mut jar, &r);
@@ -161,6 +177,8 @@ fn main() -> std::io::Result<()> {
     }
     st.select(if s.podcasts.is_empty() { None } else { Some(0) });
     let mut t = ratatui::init();
+    let _restore = Restore;
+    ctrlc::set_handler(|| INT.store(true, std::sync::atomic::Ordering::SeqCst)).ok();
     loop {
         t.draw(|f| {
             let [main, help] = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(f.area());
@@ -269,10 +287,7 @@ fn main() -> std::io::Result<()> {
                     let start = p.resume.get(id).copied().unwrap_or(0);
                     save(&s);
                     if let (true, Some(url)) = (play_it, url) {
-                        ratatui::restore();
-                        cheatsheet(title);
-                        let pos = play(url, start);
-                        t = ratatui::init();
+                        let pos = shell_out(&mut t, || { cheatsheet(title); play(url, start) });
                         match pos {
                             Some(x) => { s.podcasts[*pi].resume.insert(id.clone(), x); }
                             None => { s.podcasts[*pi].resume.remove(id); }
@@ -290,9 +305,7 @@ fn main() -> std::io::Result<()> {
                 K::Char('d') if !s.podcasts.is_empty() => ask = true,
                 K::Char('s') => {
                     if s.sync { s.sync = false; s.cookie.clear(); msg = "Overcast sync off".into(); } else {
-                        ratatui::restore();
-                        let c = login();
-                        t = ratatui::init();
+                        let c = shell_out(&mut t, login);
                         msg = if c.is_some() { "Overcast sync on".into() } else { "Overcast login failed or timed out".into() };
                         s.sync = c.is_some();
                         s.cookie = c.unwrap_or_default();
@@ -309,6 +322,5 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
-    ratatui::restore();
     Ok(())
 }
