@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap as Map, process::Command};
 
 #[derive(Serialize, Deserialize, Default)]
-struct Settings { podcasts: Vec<Podcast> }
+#[serde(default)]
+struct Settings { podcasts: Vec<Podcast>, sync: bool, cookie: String }
 #[derive(Serialize, Deserialize, Default)]
 struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64> }
 type Ep = (String, String, Option<String>);
+struct Oc { id: String, url: String, played: bool, progress: u64 }
 
 fn file() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -19,10 +21,62 @@ fn load() -> Settings {
 fn save(s: &Settings) {
     let f = file();
     let _ = std::fs::create_dir_all(f.parent().unwrap());
-    let _ = std::fs::write(f, serde_json::to_string_pretty(s).unwrap());
+    let _ = std::fs::write(&f, serde_json::to_string_pretty(s).unwrap());
+    let _ = std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o600));
 }
 fn fetch(url: &str) -> Result<rss::Channel, Box<dyn std::error::Error>> {
     Ok(rss::Channel::read_from(&ureq::get(url).call()?.body_mut().read_to_vec()?[..])?)
+}
+
+fn between<'a>(s: &'a str, a: &str, b: &str) -> &'a str {
+    s.split_once(a).and_then(|(_, r)| r.split_once(b)).map_or("", |(x, _)| x)
+}
+
+fn keep(jar: &mut Map<String, String>, r: &ureq::http::Response<ureq::Body>) {
+    for h in r.headers().get_all("set-cookie") {
+        if let Some((k, v)) = h.to_str().ok().and_then(|h| h.split(';').next()).and_then(|c| c.split_once('=')) {
+            jar.insert(k.into(), v.into());
+        }
+    }
+}
+
+fn login() -> Option<String> {
+    use qrcode::render::unicode::Dense1x2::{Dark, Light};
+    let (mut jar, cookie) = (Map::new(), |j: &Map<String, String>| j.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "));
+    let mut r = ureq::get("https://overcast.fm/login").call().ok()?;
+    keep(&mut jar, &r);
+    let html = r.body_mut().read_to_string().ok()?;
+    let token = between(&html, "data-token=\"", "\"").to_string();
+    let qr = qrcode::QrCode::new(format!("overcast:///auth?t={token}&l=browser")).ok()?;
+    println!("\nScan with your iPhone camera to log in with the Overcast app (Ctrl-C cancels):\n");
+    println!("{}", qr.render::<qrcode::render::unicode::Dense1x2>().dark_color(Light).light_color(Dark).build());
+    println!("No camera? Open https://overcast.fm/main/login_app?t={token}&l=browser on your phone.");
+    for _ in 0..300 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let sent = ureq::post("https://overcast.fm/main/login_qr_verify").header("Cookie", cookie(&jar)).send_form([("token", token.as_str()), ("then", "podcasts")]);
+        let Ok(mut r) = sent else { continue };
+        keep(&mut jar, &r);
+        if r.body_mut().read_to_string().ok()?.len() > 1 { return Some(cookie(&jar)).filter(|c| !c.is_empty()) }
+    }
+    None
+}
+
+fn pull(cookie: &str) -> Result<Map<String, Oc>, Box<dyn std::error::Error>> {
+    let xml = ureq::get("https://overcast.fm/account/export_opml/extended").header("Cookie", cookie).call()?.body_mut().read_to_string()?;
+    let doc = roxmltree::Document::parse(&xml)?;
+    Ok(doc.descendants().filter(|n| n.attribute("type") == Some("podcast-episode")).filter_map(|n| {
+        let oc = Oc { id: n.attribute("overcastId")?.into(), url: n.attribute("overcastUrl")?.into(), played: n.attribute("played") == Some("1"),
+            progress: n.attribute("progress").and_then(|p| p.parse().ok()).unwrap_or(0) };
+        Some((n.attribute("enclosureUrl")?.to_string(), oc))
+    }).collect())
+}
+
+fn push(cookie: &str, o: &Oc, pos: Option<u64>) -> bool {
+    let Some(page) = ureq::get(&o.url).header("Cookie", cookie).call().ok().and_then(|mut r| r.body_mut().read_to_string().ok()) else { return false };
+    if between(&page, "data-saved-for-user=\"", "\"") != "1" { return false }
+    let p = pos.unwrap_or(0x7FFFFFFF).to_string();
+    let form = [("p", p.as_str()), ("speed", between(&page, "data-speed-id=\"", "\"")), ("v", between(&page, "data-sync-version=\"", "\""))];
+    ureq::post(&format!("https://overcast.fm/podcasts/set_progress/{}", o.id)).header("Cookie", cookie).send_form(form).is_ok()
 }
 
 fn cheatsheet(title: &str) {
@@ -78,6 +132,7 @@ fn nav(st: &mut ListState, typed: &mut String, len: usize, c: K) -> bool {
 
 fn main() -> std::io::Result<()> {
     let (mut s, mut st, mut typed, mut msg) = (load(), ListState::default(), String::new(), String::new());
+    let mut oc: Map<String, Oc> = Map::new();
     let (mut eps, mut input, mut job, mut ask): (Option<(usize, Vec<Ep>)>, Option<String>, Option<Result<usize, String>>, bool) = (None, None, None, false);
     st.select(if s.podcasts.is_empty() { None } else { Some(0) });
     let mut t = ratatui::init();
@@ -88,7 +143,7 @@ fn main() -> std::io::Result<()> {
                 ListItem::new(format!("{:>w$}  {text}", i + 1, w = n.to_string().len())).style(if dim { Color::DarkGray } else { Color::Reset })
             };
             let (title, foot, items): (String, String, Vec<ListItem>) = match &eps {
-                None => (" ♪ Johncast ".into(), "".into(), s.podcasts.iter().enumerate()
+                None => (if s.sync { " ♪ Johncast · Overcast sync on " } else { " ♪ Johncast " }.into(), "".into(), s.podcasts.iter().enumerate()
                     .map(|(i, p)| row(i, s.podcasts.len(), format!("{}   {} listened", p.title, p.listened.len()), false)).collect()),
                 Some((pi, v)) => {
                     let p = &s.podcasts[*pi];
@@ -108,7 +163,7 @@ fn main() -> std::io::Result<()> {
                 else if let Some(u) = &input { format!("Feed URL: {u}▏  (Enter to add, Esc to cancel)") }
                 else if ask { "Remove this podcast? y = yes, any other key cancels".into() }
                 else if eps.is_some() { "↑↓ or type a number   Enter play   Space mark listened   Esc back".into() }
-                else { "↑↓ or type a number   Enter open   a add feed   d remove   q quit".into() };
+                else { "↑↓ or type a number   Enter open   a add feed   d remove   s Overcast sync   q quit".into() };
             f.render_widget(Paragraph::new(hint).style(if input.is_some() { Color::Yellow } else { Color::DarkGray }), help);
         })?;
         if let Some(j) = job.take() {
@@ -126,6 +181,22 @@ fn main() -> std::io::Result<()> {
                         let id = x.guid().map(|g| g.value()).or(x.link()).or(x.title()).unwrap_or_default();
                         (id.into(), x.title().unwrap_or("(untitled)").into(), x.enclosure().map(|e| e.url().into()))
                     }).collect();
+                    if s.sync {
+                        match pull(&s.cookie) {
+                            Ok(m) => oc = m,
+                            Err(_) => { s.sync = false; msg = "Overcast session expired. Press s to log in again.".into(); }
+                        }
+                        let mut hit = 0;
+                        for e in &v {
+                            let Some(o) = e.2.as_ref().and_then(|u| oc.get(u)) else { continue };
+                            let p = &mut s.podcasts[i];
+                            hit += 1;
+                            if o.played && !p.listened.contains(&e.0) { p.listened.push(e.0.clone()) }
+                            if o.played { p.resume.remove(&e.0); } else if o.progress > 0 { p.resume.insert(e.0.clone(), o.progress); }
+                        }
+                        if s.sync { msg = format!("Overcast: {hit} of {} episodes matched", v.len()); }
+                        save(&s);
+                    }
                     st.select(v.iter().position(|e| !s.podcasts[i].listened.contains(&e.0)).or(v.len().checked_sub(1)));
                     eps = Some((i, v));
                 }
@@ -182,6 +253,7 @@ fn main() -> std::io::Result<()> {
                             None => { s.podcasts[*pi].resume.remove(id); }
                         }
                         save(&s);
+                        if s.sync && let Some(o) = oc.get(url) && !push(&s.cookie, o, pos) { msg = "Overcast not updated (is the episode in your library?)".into(); }
                     }
                 },
                 _ => {}
@@ -191,6 +263,17 @@ fn main() -> std::io::Result<()> {
                 K::Char('q') | K::Esc => break,
                 K::Char('a') => input = Some(String::new()),
                 K::Char('d') if !s.podcasts.is_empty() => ask = true,
+                K::Char('s') => {
+                    if s.sync { s.sync = false; s.cookie.clear(); msg = "Overcast sync off".into(); } else {
+                        ratatui::restore();
+                        let c = login();
+                        t = ratatui::init();
+                        msg = if c.is_some() { "Overcast sync on".into() } else { "Overcast login failed or timed out".into() };
+                        s.sync = c.is_some();
+                        s.cookie = c.unwrap_or_default();
+                    }
+                    save(&s);
+                }
                 K::Enter | K::Right => if let Some(i) = st.selected() { msg = "Loading episodes…".into(); job = Some(Ok(i)); },
                 _ => {}
             }
