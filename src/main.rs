@@ -61,14 +61,32 @@ fn login() -> Option<String> {
     None
 }
 
-fn pull(cookie: &str) -> Result<Map<String, Oc>, Box<dyn std::error::Error>> {
+type Feeds = Vec<(String, String)>;
+
+fn pull(cookie: &str) -> Result<(Map<String, Oc>, Feeds), Box<dyn std::error::Error>> {
     let xml = ureq::get("https://overcast.fm/account/export_opml/extended").header("Cookie", cookie).call()?.body_mut().read_to_string()?;
     let doc = roxmltree::Document::parse(&xml)?;
-    Ok(doc.descendants().filter(|n| n.attribute("type") == Some("podcast-episode")).filter_map(|n| {
+    let feeds = doc.descendants().filter(|n| n.attribute("type") == Some("rss") && n.attribute("subscribed") == Some("1"))
+        .filter_map(|n| Some((n.attribute("xmlUrl")?.to_string(), n.attribute("title").or(n.attribute("text"))?.to_string()))).collect();
+    let eps = doc.descendants().filter(|n| n.attribute("type") == Some("podcast-episode")).filter_map(|n| {
         let oc = Oc { id: n.attribute("overcastId")?.into(), url: n.attribute("overcastUrl")?.into(), played: n.attribute("played") == Some("1"),
             progress: n.attribute("progress").and_then(|p| p.parse().ok()).unwrap_or(0) };
         Some((n.attribute("enclosureUrl")?.to_string(), oc))
-    }).collect())
+    }).collect();
+    Ok((eps, feeds))
+}
+
+fn import(s: &mut Settings, feeds: Feeds) -> usize {
+    let key = |u: &str| u.to_lowercase().trim_end_matches('/').split_once("://").map_or(u.to_string(), |x| x.1.to_string());
+    let (mut old, mut added) = (std::mem::take(&mut s.podcasts), 0);
+    for (url, title) in feeds {
+        match old.iter().position(|p| key(&p.url) == key(&url)) {
+            Some(i) => s.podcasts.push(old.remove(i)),
+            None => { added += 1; s.podcasts.push(Podcast { url, title, ..Default::default() }) }
+        }
+    }
+    s.podcasts.extend(old);
+    added
 }
 
 fn push(cookie: &str, o: &Oc, pos: Option<u64>) -> bool {
@@ -134,6 +152,13 @@ fn main() -> std::io::Result<()> {
     let (mut s, mut st, mut typed, mut msg) = (load(), ListState::default(), String::new(), String::new());
     let mut oc: Map<String, Oc> = Map::new();
     let (mut eps, mut input, mut job, mut ask): (Option<(usize, Vec<Ep>)>, Option<String>, Option<Result<usize, String>>, bool) = (None, None, None, false);
+    if s.sync {
+        println!("Syncing with Overcast…");
+        match pull(&s.cookie) {
+            Ok((m, f)) => { oc = m; msg = format!("Overcast: added {} podcasts", import(&mut s, f)); save(&s); }
+            Err(_) => { s.sync = false; msg = "Overcast session expired. Press s to log in again.".into(); }
+        }
+    }
     st.select(if s.podcasts.is_empty() { None } else { Some(0) });
     let mut t = ratatui::init();
     loop {
@@ -183,7 +208,7 @@ fn main() -> std::io::Result<()> {
                     }).collect();
                     if s.sync {
                         match pull(&s.cookie) {
-                            Ok(m) => oc = m,
+                            Ok((m, _)) => oc = m,
                             Err(_) => { s.sync = false; msg = "Overcast session expired. Press s to log in again.".into(); }
                         }
                         let mut hit = 0;
@@ -271,6 +296,11 @@ fn main() -> std::io::Result<()> {
                         msg = if c.is_some() { "Overcast sync on".into() } else { "Overcast login failed or timed out".into() };
                         s.sync = c.is_some();
                         s.cookie = c.unwrap_or_default();
+                        if s.sync && let Ok((m, f)) = pull(&s.cookie) {
+                            oc = m;
+                            msg = format!("Overcast sync on. Added {} podcasts.", import(&mut s, f));
+                            st.select(Some(0));
+                        }
                     }
                     save(&s);
                 }
