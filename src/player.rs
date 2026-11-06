@@ -116,6 +116,27 @@ fn send(w: &mut UnixStream, cmd: Value) {
     let _ = writeln!(w, "{}", json!({ "command": cmd }));
 }
 
+fn probe() -> Option<ProtocolType> {
+    let mut out = io::stdout();
+    out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c").ok()?;
+    out.flush().ok()?;
+    let (mut buf, end) = (Vec::new(), std::time::Instant::now() + Duration::from_millis(500));
+    let da1 = |b: &[u8]| b.windows(3).position(|w| w == b"\x1b[?").and_then(|i| b[i..].iter().position(|c| *c == b'c').map(|j| b[i + 3..i + j].to_vec()));
+    while std::time::Instant::now() < end {
+        let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut fd, 1, 50) } <= 0 { continue; }
+        let mut chunk = [0u8; 256];
+        let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 { break; }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        if let Some(attrs) = da1(&buf) {
+            if buf.windows(9).any(|w| w == b"_Gi=31;OK") { return Some(ProtocolType::Kitty); }
+            return String::from_utf8_lossy(&attrs).split(';').any(|a| a == "4").then_some(ProtocolType::Sixel).or(Some(ProtocolType::Halfblocks));
+        }
+    }
+    None
+}
+
 #[allow(deprecated)]
 pub fn picker() -> Picker {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
@@ -123,13 +144,15 @@ pub fn picker() -> Picker {
     let (w, h) = size.map_or((10, 20), |s| (s.width / s.columns, s.height / s.rows));
     let mut p = Picker::from_fontsize(ratatui_image::FontSize::new(w, h));
     let (term, prog) = (env("TERM"), env("TERM_PROGRAM"));
+    let found = probe();
     let proto = match env("JOHNCAST_IMAGES").as_str() {
         "kitty" => Some(ProtocolType::Kitty),
         "sixel" => Some(ProtocolType::Sixel),
         "iterm" => Some(ProtocolType::Iterm2),
         "blocks" => Some(ProtocolType::Halfblocks),
+        _ if found.is_some() => found,
         _ if !env("KITTY_WINDOW_ID").is_empty() || term.contains("kitty") || term.contains("ghostty") || prog == "WezTerm" || prog == "ghostty" => Some(ProtocolType::Kitty),
-        _ if term.starts_with("foot") || term.contains("mlterm") || env("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 8000) => Some(ProtocolType::Sixel),
+        _ if term.starts_with("foot") || term.contains("mlterm") => Some(ProtocolType::Sixel),
         _ => None,
     };
     if let Some(t) = proto { p.set_protocol_type(t); }
