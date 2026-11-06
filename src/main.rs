@@ -152,7 +152,6 @@ fn main() -> std::io::Result<()> {
     st.select(if s.podcasts.is_empty() { None } else { Some(0) });
     let mut t = ratatui::init();
     let _restore = Restore;
-    let picker = player::picker();
     ctrlc::set_handler(|| INT.store(true, std::sync::atomic::Ordering::SeqCst)).ok();
     loop {
         t.draw(|f| {
@@ -267,7 +266,7 @@ fn main() -> std::io::Result<()> {
                     if let (true, Some(url)) = (play_it, url) {
                         let track = player::Track { title: title.clone(), show: s.podcasts[*pi].title.clone(), url: url.clone(), start, art: art.clone(), chapters: chapters.clone() };
                         s.podcasts[*pi].played = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                        let pos = match player::play(&mut t, &picker, track) {
+                        let pos = match player::play(&mut t, track) {
                             Ok(p) => p,
                             Err(e) => { msg = format!("Could not play: {e}"); continue }
                         };

@@ -1,7 +1,6 @@
 use ratatui::crossterm::event::{self, Event, KeyCode as K, KeyEventKind::Press, KeyModifiers};
 use ratatui::{prelude::*, widgets::*, DefaultTerminal};
 use image::imageops::FilterType;
-use ratatui_image::{picker::{Picker, ProtocolType}, protocol::StatefulProtocol, Resize, StatefulImage};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -116,51 +115,37 @@ fn send(w: &mut UnixStream, cmd: Value) {
     let _ = writeln!(w, "{}", json!({ "command": cmd }));
 }
 
-fn probe() -> Option<ProtocolType> {
-    let mut out = io::stdout();
-    out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c").ok()?;
-    out.flush().ok()?;
-    let (mut buf, end) = (Vec::new(), std::time::Instant::now() + Duration::from_millis(500));
-    let da1 = |b: &[u8]| b.windows(3).position(|w| w == b"\x1b[?").and_then(|i| b[i..].iter().position(|c| *c == b'c').map(|j| b[i + 3..i + j].to_vec()));
-    while std::time::Instant::now() < end {
-        let mut fd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
-        if unsafe { libc::poll(&mut fd, 1, 50) } <= 0 { continue; }
-        let mut chunk = [0u8; 256];
-        let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 { break; }
-        buf.extend_from_slice(&chunk[..n as usize]);
-        if let Some(attrs) = da1(&buf) {
-            if buf.windows(9).any(|w| w == b"_Gi=31;OK") { return Some(ProtocolType::Kitty); }
-            return String::from_utf8_lossy(&attrs).split(';').any(|a| a == "4").then_some(ProtocolType::Sixel).or(Some(ProtocolType::Halfblocks));
+struct Art { img: image::DynamicImage, key: (u16, u16), w: u16, h: u16, cells: Vec<(char, [f32; 3], [f32; 3])> }
+
+impl Art {
+    fn new(img: image::DynamicImage) -> Self { Art { img, key: (0, 0), w: 0, h: 0, cells: vec![] } }
+    fn draw(&mut self, slot: Rect, truecolor: bool, buf: &mut Buffer) {
+        if self.key != (slot.width, slot.height) {
+            let im = self.img.resize(slot.width as u32 * 2, slot.height as u32 * 2, FilterType::Lanczos3).to_rgb8();
+            let px = |x: u32, y: u32| im.get_pixel(x.min(im.width() - 1), y.min(im.height() - 1)).0.map(f32::from);
+            let mean = |v: &[[f32; 3]]| { let n = v.len().max(1) as f32; [0, 1, 2].map(|i| v.iter().map(|p| p[i]).sum::<f32>() / n) };
+            let err = |v: &[[f32; 3]], m: [f32; 3]| v.iter().map(|p| (0..3).map(|i| [2.0, 4.0, 3.0][i] * (p[i] - m[i]).powi(2)).sum::<f32>()).sum::<f32>();
+            (self.key, self.w, self.h, self.cells) = ((slot.width, slot.height), im.width().div_ceil(2) as u16, im.height().div_ceil(2) as u16, vec![]);
+            for cy in 0..self.h as u32 { for cx in 0..self.w as u32 {
+                let q = [px(2 * cx, 2 * cy), px(2 * cx + 1, 2 * cy), px(2 * cx, 2 * cy + 1), px(2 * cx + 1, 2 * cy + 1)];
+                self.cells.push((0..8).map(|m| {
+                    let (fg, bg): (Vec<_>, Vec<_>) = (0..4).partition(|i| m >> i & 1 == 1);
+                    let (fg, bg) = (fg.iter().map(|&i| q[i]).collect::<Vec<_>>(), bg.iter().map(|&i| q[i]).collect::<Vec<_>>());
+                    let (mf, mb) = (mean(&fg), mean(&bg));
+                    (err(&fg, mf) + err(&bg, mb), " ▘▝▀▖▌▞▛".chars().nth(m).unwrap(), if fg.is_empty() { mb } else { mf }, mb)
+                }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, g, f, b)| (g, f, b)).unwrap());
+            } }
+        }
+        let col = |c: [f32; 3]| { let c = c.map(|v| v.round() as u8); if truecolor { Color::Rgb(c[0], c[1], c[2]) } else { Color::Indexed(16 + 36 * (c[0] as u16 * 5 / 255) as u8 + 6 * (c[1] as u16 * 5 / 255) as u8 + (c[2] as u16 * 5 / 255) as u8) } };
+        let (x0, y0) = (slot.x + (slot.width - self.w) / 2, slot.y + (slot.height - self.h) / 2);
+        for (i, (g, f, b)) in self.cells.iter().enumerate() {
+            if let Some(c) = buf.cell_mut((x0 + i as u16 % self.w, y0 + i as u16 / self.w)) { c.set_char(*g).set_fg(col(*f)).set_bg(col(*b)); }
         }
     }
-    None
-}
-
-#[allow(deprecated)]
-pub fn picker() -> Picker {
-    let env = |k: &str| std::env::var(k).unwrap_or_default();
-    let size = ratatui::crossterm::terminal::window_size().ok().filter(|s| s.columns > 0 && s.rows > 0 && s.width > 0 && s.height > 0);
-    let (w, h) = size.map_or((10, 20), |s| (s.width / s.columns, s.height / s.rows));
-    let mut p = Picker::from_fontsize(ratatui_image::FontSize::new(w, h));
-    let (term, prog) = (env("TERM"), env("TERM_PROGRAM"));
-    let found = probe();
-    let proto = match env("JOHNCAST_IMAGES").as_str() {
-        "kitty" => Some(ProtocolType::Kitty),
-        "sixel" => Some(ProtocolType::Sixel),
-        "iterm" => Some(ProtocolType::Iterm2),
-        "blocks" => Some(ProtocolType::Halfblocks),
-        _ if found.is_some() => found,
-        _ if !env("KITTY_WINDOW_ID").is_empty() || term.contains("kitty") || term.contains("ghostty") || prog == "WezTerm" || prog == "ghostty" => Some(ProtocolType::Kitty),
-        _ if term.starts_with("foot") || term.contains("mlterm") => Some(ProtocolType::Sixel),
-        _ => None,
-    };
-    if let Some(t) = proto { p.set_protocol_type(t); }
-    p
 }
 
 /// Plays a track full-screen. Returns where to resume, or None if it played to the end.
-pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<Option<u64>> {
+pub fn play(t: &mut DefaultTerminal, tr: Track) -> io::Result<Option<u64>> {
     let sock = std::env::temp_dir().join(format!("johncast-{}.sock", std::process::id()));
     let child = Command::new("mpv")
         .args(["--no-video", "--no-terminal", "--idle=no", "--audio-display=no"])
@@ -183,12 +168,13 @@ pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<O
     let (title, show) = (tr.title.clone(), tr.show.clone());
     thread::spawn(move || load(tr, tx));
 
-    let (mut chaps, mut imgs, mut sel, mut focus, mut help): (Vec<Chap>, Map<String, StatefulProtocol>, _, _, _) = (vec![], Map::new(), ListState::default(), false, false);
+    let truecolor = std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
+    let (mut chaps, mut imgs, mut sel, mut focus, mut help): (Vec<Chap>, Map<String, Art>, _, _, _) = (vec![], Map::new(), ListState::default(), false, false);
     loop {
         for m in rx.try_iter() {
             match m {
                 Msg::Chapters(c) => chaps = c,
-                Msg::Img(k, img) => { imgs.insert(k, picker.new_resize_protocol(img)); }
+                Msg::Img(k, img) => { imgs.insert(k, Art::new(img)); }
             }
         }
         let (pos, dur, pause, vol, speed, mute, buffering, eof, closed) = {
@@ -205,15 +191,14 @@ pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<O
             let outer = Block::bordered().border_type(BorderType::Rounded).border_style(Color::Cyan).title(" ♪ Now Playing ").title_bottom(hints);
             let inner = outer.inner(f.area());
             f.render_widget(outer, f.area());
-            let fs = picker.font_size();
             let art_h = inner.height.min(24).min(inner.width / 4);
-            let art_w = if inner.width >= 64 { (art_h as u32 * fs.height as u32 / fs.width.max(1) as u32).min(inner.width as u32 / 2) as u16 } else { 0 };
+            let art_w = if inner.width >= 64 { (art_h * 2).min(inner.width / 2) } else { 0 };
             let [left, right] = Layout::horizontal([Constraint::Length(if art_w > 0 { art_w + 2 } else { 0 }), Constraint::Min(10)]).areas(inner);
             if art_w > 0 {
                 let slot = Rect::new(left.x + 1, left.y, art_w, art_h.min(left.height));
                 let key = cur.map(|i| format!("ch{i}")).filter(|k| imgs.contains_key(k)).unwrap_or("art".into());
                 match imgs.get_mut(&key) {
-                    Some(p) => f.render_stateful_widget(StatefulImage::default().resize(Resize::Fit(Some(FilterType::Lanczos3))), slot, p),
+                    Some(p) => p.draw(slot, truecolor, f.buffer_mut()),
                     None => f.render_widget(Paragraph::new("\n♪").centered().style(Color::DarkGray).block(Block::bordered().border_style(Color::DarkGray)), slot),
                 }
             }
