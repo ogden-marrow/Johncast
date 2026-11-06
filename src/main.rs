@@ -10,7 +10,7 @@ mod player;
 #[serde(default)]
 struct Settings { podcasts: Vec<Podcast>, sync: bool, cookie: String }
 #[derive(Serialize, Deserialize, Default)]
-struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64>, #[serde(default)] played: u64 }
+struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64>, #[serde(default)] played: u64, #[serde(default)] last: String }
 type Ep = (String, String, Option<String>, Option<String>, Option<String>);
 static INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 struct Restore;
@@ -217,7 +217,7 @@ fn main() -> std::io::Result<()> {
                         if s.sync { msg = format!("Overcast: {hit} of {} episodes matched", v.len()); }
                         save(&s);
                     }
-                    st.select(v.iter().position(|e| !s.podcasts[i].listened.contains(&e.0)).or(v.len().checked_sub(1)));
+                    st.select(v.iter().position(|e| e.0 == s.podcasts[i].last).or_else(|| v.iter().position(|e| !s.podcasts[i].listened.contains(&e.0))).or(v.len().checked_sub(1)));
                     eps = Some((i, v));
                 }
             }
@@ -265,6 +265,7 @@ fn main() -> std::io::Result<()> {
                     save(&s);
                     if let (true, Some(url)) = (play_it, url) {
                         let track = player::Track { title: title.clone(), show: s.podcasts[*pi].title.clone(), url: url.clone(), start, art: art.clone(), chapters: chapters.clone() };
+                        s.podcasts[*pi].last = id.clone();
                         s.podcasts[*pi].played = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                         let pos = match player::play(&mut t, track) {
                             Ok(p) => p,
