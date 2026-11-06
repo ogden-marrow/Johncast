@@ -1,6 +1,7 @@
 use ratatui::crossterm::event::{self, Event, KeyCode as K, KeyEventKind::Press, KeyModifiers};
 use ratatui::{prelude::*, widgets::*, DefaultTerminal};
-use ratatui_image::{picker::{Picker, ProtocolType}, protocol::StatefulProtocol, StatefulImage};
+use image::imageops::FilterType;
+use ratatui_image::{picker::{Picker, ProtocolType}, protocol::StatefulProtocol, Resize, StatefulImage};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -41,7 +42,7 @@ fn bytes(url: &str, limit: u64) -> Option<Vec<u8>> {
 }
 
 fn decode(b: &[u8]) -> Option<image::DynamicImage> {
-    image::load_from_memory(b).ok().map(|i| i.thumbnail(480, 480))
+    image::load_from_memory(b).ok().map(|i| i.thumbnail(720, 720))
 }
 
 fn id3_tag(url: &str) -> Option<id3::Tag> {
@@ -128,7 +129,7 @@ pub fn picker() -> Picker {
         "iterm" => Some(ProtocolType::Iterm2),
         "blocks" => Some(ProtocolType::Halfblocks),
         _ if !env("KITTY_WINDOW_ID").is_empty() || term.contains("kitty") || term.contains("ghostty") || prog == "WezTerm" || prog == "ghostty" => Some(ProtocolType::Kitty),
-        _ if term.starts_with("foot") || term.contains("mlterm") => Some(ProtocolType::Sixel),
+        _ if term.starts_with("foot") || term.contains("mlterm") || env("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 8000) => Some(ProtocolType::Sixel),
         _ => None,
     };
     if let Some(t) = proto { p.set_protocol_type(t); }
@@ -159,7 +160,7 @@ pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<O
     let (title, show) = (tr.title.clone(), tr.show.clone());
     thread::spawn(move || load(tr, tx));
 
-    let (mut chaps, mut imgs, mut sel, mut focus): (Vec<Chap>, Map<String, StatefulProtocol>, _, _) = (vec![], Map::new(), ListState::default(), false);
+    let (mut chaps, mut imgs, mut sel, mut focus, mut help): (Vec<Chap>, Map<String, StatefulProtocol>, _, _, _) = (vec![], Map::new(), ListState::default(), false, false);
     loop {
         for m in rx.try_iter() {
             match m {
@@ -177,17 +178,19 @@ pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<O
         if !focus { sel.select(cur); }
 
         t.draw(|f| {
-            let hints = " space pause · ←→ seek · ↑↓ volume · [ ] speed · , . chapter · tab chapters · q back ";
+            let hints = " space pause · ←→ 5s · ↑↓ 1m · [ ] speed · 9 0 volume · m mute · ? all keys · q back ";
             let outer = Block::bordered().border_type(BorderType::Rounded).border_style(Color::Cyan).title(" ♪ Now Playing ").title_bottom(hints);
             let inner = outer.inner(f.area());
             f.render_widget(outer, f.area());
-            let art_w = if inner.width >= 64 { (inner.width / 3).clamp(20, 40) } else { 0 };
+            let fs = picker.font_size();
+            let art_h = inner.height.min(24).min(inner.width / 4);
+            let art_w = if inner.width >= 64 { (art_h as u32 * fs.height as u32 / fs.width.max(1) as u32).min(inner.width as u32 / 2) as u16 } else { 0 };
             let [left, right] = Layout::horizontal([Constraint::Length(if art_w > 0 { art_w + 2 } else { 0 }), Constraint::Min(10)]).areas(inner);
             if art_w > 0 {
-                let slot = Rect::new(left.x + 1, left.y, art_w, (art_w / 2).min(left.height));
+                let slot = Rect::new(left.x + 1, left.y, art_w, art_h.min(left.height));
                 let key = cur.map(|i| format!("ch{i}")).filter(|k| imgs.contains_key(k)).unwrap_or("art".into());
                 match imgs.get_mut(&key) {
-                    Some(p) => f.render_stateful_widget(StatefulImage::default(), slot, p),
+                    Some(p) => f.render_stateful_widget(StatefulImage::default().resize(Resize::Fit(Some(FilterType::Lanczos3))), slot, p),
                     None => f.render_widget(Paragraph::new("\n♪").centered().style(Color::DarkGray).block(Block::bordered().border_style(Color::DarkGray)), slot),
                 }
             }
@@ -222,14 +225,38 @@ pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<O
                 let hl = if focus { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
                 f.render_stateful_widget(List::new(items).block(block).highlight_style(hl).highlight_symbol(if focus { "▸ " } else { "  " }), list, &mut sel);
             }
+            if help {
+                let rows = ["PLAYHEAD", "←  /  →|back / forward 5 seconds", "↓  /  ↑|back / forward 1 minute", "Shift+←  /  →|back / forward 1 second (exact)",
+                    "Page Up  /  Down|next / previous chapter", "Tab|pick a chapter from the list", "SPEED", "[  /  ]|slower / faster by 10%", "{  /  }|half / double speed",
+                    "Backspace|reset to normal speed", "VOLUME", "9  /  0|volume down / up", "m|mute / unmute", "PLAYBACK", "Space|pause / resume", "q|quit (saves your place)"];
+                let lines: Vec<Line> = rows.iter().map(|r| match r.split_once('|') {
+                    None => Line::from(format!(" {r}")).magenta().bold(),
+                    Some((k, d)) => Line::from(vec![format!("   {k:<20}").yellow(), d.to_string().dark_gray()]),
+                }).collect();
+                let (w, h) = (66.min(f.area().width), (lines.len() as u16 + 2).min(f.area().height));
+                let r = Rect::new(f.area().x + (f.area().width - w) / 2, f.area().y + (f.area().height - h) / 2, w, h);
+                f.render_widget(Clear, r);
+                f.render_widget(Paragraph::new(lines).block(Block::bordered().border_type(BorderType::Rounded).border_style(Color::Cyan).title(" Keys ")), r);
+            }
         })?;
 
         if !event::poll(Duration::from_millis(100))? { continue; }
         let Event::Key(k) = event::read()? else { continue };
         if k.kind != Press { continue; }
+        if help { help = false; continue; }
         let jump = |w: &mut UnixStream, to: f64| send(w, json!(["seek", to, "absolute"]));
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let chapter = |w: &mut UnixStream, step: i32| {
+            let Some(i) = cur.or(Some(0)).filter(|_| !chaps.is_empty()) else { return };
+            if step < 0 {
+                jump(w, if pos - chaps[i].t > 3.0 || i == 0 { chaps[i].t } else { chaps[i - 1].t });
+            } else if let Some(c) = chaps.get(cur.map_or(0, |i| i + 1)) {
+                jump(w, c.t);
+            }
+        };
         match k.code {
             K::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => break,
+            K::Char('?') => help = true,
             K::Esc if focus => focus = false,
             K::Char('q') | K::Esc => break,
             K::Tab if !chaps.is_empty() => focus = !focus,
@@ -239,20 +266,22 @@ pub fn play(t: &mut DefaultTerminal, picker: &Picker, tr: Track) -> io::Result<O
                 sel.select(Some(if k.code == K::Up { (i + n - 1) % n } else { (i + 1) % n }));
             }
             K::Char(' ') => send(&mut w, json!(["set_property", "pause", !pause])),
-            K::Left => send(&mut w, json!(["seek", -15, "relative"])),
-            K::Right => send(&mut w, json!(["seek", 30, "relative"])),
-            K::Up => send(&mut w, json!(["add", "volume", 5])),
-            K::Down => send(&mut w, json!(["add", "volume", -5])),
-            K::Char('[') => send(&mut w, json!(["set_property", "speed", ((speed * 10.0).round() - 1.0).max(5.0) / 10.0])),
-            K::Char(']') => send(&mut w, json!(["set_property", "speed", ((speed * 10.0).round() + 1.0).min(30.0) / 10.0])),
+            K::Left if shift => send(&mut w, json!(["seek", -1, "relative+exact"])),
+            K::Right if shift => send(&mut w, json!(["seek", 1, "relative+exact"])),
+            K::Left => send(&mut w, json!(["seek", -5, "relative"])),
+            K::Right => send(&mut w, json!(["seek", 5, "relative"])),
+            K::Up => send(&mut w, json!(["seek", 60, "relative"])),
+            K::Down => send(&mut w, json!(["seek", -60, "relative"])),
+            K::Char('[') => send(&mut w, json!(["multiply", "speed", 1.0 / 1.1])),
+            K::Char(']') => send(&mut w, json!(["multiply", "speed", 1.1])),
+            K::Char('{') => send(&mut w, json!(["multiply", "speed", 0.5])),
+            K::Char('}') => send(&mut w, json!(["multiply", "speed", 2.0])),
             K::Backspace => send(&mut w, json!(["set_property", "speed", 1.0])),
+            K::Char('9') | K::Char('/') => send(&mut w, json!(["add", "volume", -2])),
+            K::Char('0') | K::Char('*') => send(&mut w, json!(["add", "volume", 2])),
             K::Char('m') => send(&mut w, json!(["cycle", "mute"])),
-            K::Char(',') | K::Char('<') => {
-                if let Some(i) = cur { jump(&mut w, if pos - chaps[i].t > 3.0 || i == 0 { chaps[i].t } else { chaps[i - 1].t }); }
-            }
-            K::Char('.') | K::Char('>') => {
-                if let Some(c) = chaps.get(cur.map_or(0, |i| i + 1)) { jump(&mut w, c.t); }
-            }
+            K::PageUp => chapter(&mut w, 1),
+            K::PageDown => chapter(&mut w, -1),
             _ => {}
         }
     }
