@@ -2,14 +2,16 @@ use ratatui::crossterm::event::{self, Event, KeyCode as K, KeyEventKind::Press, 
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::{prelude::*, widgets::*};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap as Map, process::Command};
+use std::collections::BTreeMap as Map;
+
+mod player;
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Settings { podcasts: Vec<Podcast>, sync: bool, cookie: String }
 #[derive(Serialize, Deserialize, Default)]
 struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64> }
-type Ep = (String, String, Option<String>);
+type Ep = (String, String, Option<String>, Option<String>, Option<String>);
 static INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 struct Restore;
 impl Drop for Restore { fn drop(&mut self) { ratatui::restore(); } }
@@ -113,38 +115,6 @@ fn push(cookie: &str, o: &Oc, pos: Option<u64>) -> bool {
     ureq::post(&format!("https://overcast.fm/podcasts/set_progress/{}", o.id)).header("Cookie", cookie).send_form(form).is_ok()
 }
 
-fn cheatsheet(title: &str) {
-    let rows = ["PLAYHEAD", "←  /  →|back / forward 5 seconds", "↓  /  ↑|back / forward 1 minute",
-        "Shift+←  /  →|back / forward 1 second", "SPEED", "[  /  ]|slower / faster by 10%",
-        "{  /  }|half / double speed", "Backspace|reset speed", "VOLUME", "9  /  0|volume down / up",
-        "m|mute", "PLAYBACK", "Space|pause / resume", "q|quit (saves your place)"];
-    let line = "─".repeat(60);
-    println!("\n\x1b[1;36m╭{line}╮\n│\x1b[35m  ♪ {title:<56.56}\x1b[36m│");
-    for r in rows {
-        match r.split_once('|') {
-            None => println!("\x1b[36m├{line}┤\n│\x1b[35m  {r:<58}\x1b[36m│"),
-            Some((k, d)) => println!("\x1b[36m│\x1b[33m    {k:<18}\x1b[0;2m{d:<38}\x1b[0;1;36m│"),
-        }
-    }
-    println!("\x1b[36m╰{line}╯\x1b[0m\n");
-}
-
-fn play(url: &str, start: u64) -> Option<u64> {
-    let dir = std::env::temp_dir().join(format!("johncast-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let wl = format!("--watch-later-dir={}", dir.display());
-    let args = ["--no-video", "--term-osd-bar", "--save-position-on-quit", "--watch-later-options=start", &wl];
-    if let Err(e) = Command::new("mpv").args(args).arg(format!("--start={start}")).arg(url).status() {
-        println!("could not run mpv: {e}");
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    let pos = std::fs::read_dir(&dir).into_iter().flatten().flatten().find_map(|f| {
-        std::fs::read_to_string(f.path()).ok()?.lines().find_map(|l| l.strip_prefix("start=")?.parse::<f64>().ok())
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-    pos.map(|p| p as u64)
-}
-
 fn nav(st: &mut ListState, typed: &mut String, len: usize, c: K) -> bool {
     let cur = st.selected().unwrap_or(0);
     match c {
@@ -178,6 +148,7 @@ fn main() -> std::io::Result<()> {
     st.select(if s.podcasts.is_empty() { None } else { Some(0) });
     let mut t = ratatui::init();
     let _restore = Restore;
+    let picker = player::picker();
     ctrlc::set_handler(|| INT.store(true, std::sync::atomic::Ordering::SeqCst)).ok();
     loop {
         t.draw(|f| {
@@ -220,9 +191,12 @@ fn main() -> std::io::Result<()> {
                     st.select(Some(s.podcasts.len() - 1));
                 }
                 (Ok(c), Ok(i)) => {
+                    let show_art = c.itunes_ext().and_then(|i| i.image()).or(c.image().map(|i| i.url())).map(String::from);
                     let v: Vec<Ep> = c.items().iter().rev().map(|x| {
                         let id = x.guid().map(|g| g.value()).or(x.link()).or(x.title()).unwrap_or_default();
-                        (id.into(), x.title().unwrap_or("(untitled)").into(), x.enclosure().map(|e| e.url().into()))
+                        let art = x.itunes_ext().and_then(|i| i.image()).or(show_art.as_deref()).map(String::from);
+                        let chapters = x.extensions().get("podcast").and_then(|m| m.get("chapters")).and_then(|v| v.first()).and_then(|e| e.attrs().get("url")).cloned();
+                        (id.into(), x.title().unwrap_or("(untitled)").into(), x.enclosure().map(|e| e.url().into()), art, chapters)
                     }).collect();
                     if s.sync {
                         match pull(&s.cookie) {
@@ -276,7 +250,7 @@ fn main() -> std::io::Result<()> {
             if nav(&mut st, &mut typed, list.len(), code) { continue }
             match code {
                 K::Esc | K::Left | K::Char('q') => { st.select(Some(*pi)); eps = None; }
-                K::Char(' ') | K::Enter => if let Some((id, title, url)) = st.selected().and_then(|i| list.get(i)) {
+                K::Char(' ') | K::Enter => if let Some((id, title, url, art, chapters)) = st.selected().and_then(|i| list.get(i)) {
                     let (play_it, p) = (code == K::Enter, &mut s.podcasts[*pi]);
                     if play_it && url.is_none() { msg = "No audio in this episode.".into(); continue }
                     match p.listened.iter().position(|x| x == id) {
@@ -287,7 +261,11 @@ fn main() -> std::io::Result<()> {
                     let start = p.resume.get(id).copied().unwrap_or(0);
                     save(&s);
                     if let (true, Some(url)) = (play_it, url) {
-                        let pos = shell_out(&mut t, || { cheatsheet(title); play(url, start) });
+                        let track = player::Track { title: title.clone(), show: s.podcasts[*pi].title.clone(), url: url.clone(), start, art: art.clone(), chapters: chapters.clone() };
+                        let pos = match player::play(&mut t, &picker, track) {
+                            Ok(p) => p,
+                            Err(e) => { msg = format!("Could not play: {e}"); continue }
+                        };
                         match pos {
                             Some(x) => { s.podcasts[*pi].resume.insert(id.clone(), x); }
                             None => { s.podcasts[*pi].resume.remove(id); }
