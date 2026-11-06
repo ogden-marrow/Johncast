@@ -72,21 +72,7 @@ fn login() -> Option<String> {
         let sent = ureq::post("https://overcast.fm/main/login_qr_verify").header("Cookie", cookie(&jar)).send_form([("token", token.as_str()), ("then", "podcasts")]);
         let Ok(mut r) = sent else { continue };
         keep(&mut jar, &r);
-        let next = r.body_mut().read_to_string().ok()?;
-        if next.len() > 1 {
-            let agent: ureq::Agent = ureq::Agent::config_builder().max_redirects(0).max_redirects_will_error(false).http_status_as_error(false).build().into();
-            let abs = |l: &str| if l.starts_with("http") { l.to_string() } else { format!("https://overcast.fm/{}", l.trim_start_matches('/')) };
-            let mut url = abs(next.trim());
-            for _ in 0..6 {
-                let Ok(r) = agent.get(&url).header("Cookie", cookie(&jar)).call() else { break };
-                keep(&mut jar, &r);
-                match r.headers().get("location").and_then(|l| l.to_str().ok()) {
-                    Some(l) if r.status().is_redirection() => url = abs(l),
-                    _ => break,
-                }
-            }
-            return Some(cookie(&jar)).filter(|c| !c.is_empty());
-        }
+        if r.body_mut().read_to_string().ok()?.len() > 1 { return Some(cookie(&jar)).filter(|c| !c.is_empty()) }
     }
     None
 }
