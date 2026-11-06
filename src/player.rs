@@ -121,23 +121,34 @@ impl Art {
     fn new(img: image::DynamicImage) -> Self { Art { img, key: (0, 0), w: 0, h: 0, cells: vec![] } }
     fn draw(&mut self, slot: Rect, truecolor: bool, buf: &mut Buffer) {
         if self.key != (slot.width, slot.height) {
-            let im = self.img.resize(slot.width as u32 * 2, slot.height as u32 * 2, FilterType::Lanczos3).to_rgb8();
-            let px = |x: u32, y: u32| im.get_pixel(x.min(im.width() - 1), y.min(im.height() - 1)).0.map(f32::from);
-            let mean = |v: &[[f32; 3]]| { let n = v.len().max(1) as f32; [0, 1, 2].map(|i| v.iter().map(|p| p[i]).sum::<f32>() / n) };
-            let err = |v: &[[f32; 3]], m: [f32; 3]| v.iter().map(|p| (0..3).map(|i| [2.0, 4.0, 3.0][i] * (p[i] - m[i]).powi(2)).sum::<f32>()).sum::<f32>();
-            (self.key, self.w, self.h, self.cells) = ((slot.width, slot.height), im.width().div_ceil(2) as u16, im.height().div_ceil(2) as u16, vec![]);
+            let fit = self.img.resize(slot.width as u32 * 8, slot.height as u32 * 16, FilterType::Lanczos3);
+            let (w, h) = ((fit.width() + 4) / 8, (fit.height() + 8) / 16);
+            let im = self.img.resize_exact(w.max(1) * 8, h.max(1) * 16, FilterType::Lanczos3).to_rgb8();
+            let sharp = image::imageops::blur(&im, 5.0);
+            let mask = |f: &dyn Fn(u32, u32) -> bool| (0..128u32).fold(0u128, |a, i| a | (f(i % 8, i / 8) as u128) << i);
+            let mut glyphs: Vec<(char, u128)> = " ▘▝▀▖▌▞▛".chars().enumerate().map(|(m, c)| (c, mask(&|x, y| m >> ((y >= 8) as usize * 2 + (x >= 4) as usize) & 1 == 1))).collect();
+            glyphs.extend("▁▂▃".chars().zip(1..).chain("▅▆▇".chars().zip(5..)).map(|(c, k)| (c, mask(&|_, y| y >= 16 - 2 * k))));
+            glyphs.extend("▏▎▍".chars().zip(1..).chain("▋▊▉".chars().zip(5..)).map(|(c, k)| (c, mask(&|x, _| x < k))));
+            (self.key, self.w, self.h, self.cells) = ((slot.width, slot.height), w.max(1) as u16, h.max(1) as u16, vec![]);
             for cy in 0..self.h as u32 { for cx in 0..self.w as u32 {
-                let q = [px(2 * cx, 2 * cy), px(2 * cx + 1, 2 * cy), px(2 * cx, 2 * cy + 1), px(2 * cx + 1, 2 * cy + 1)];
-                self.cells.push((0..8).map(|m| {
-                    let (fg, bg): (Vec<_>, Vec<_>) = (0..4).partition(|i| m >> i & 1 == 1);
-                    let (fg, bg) = (fg.iter().map(|&i| q[i]).collect::<Vec<_>>(), bg.iter().map(|&i| q[i]).collect::<Vec<_>>());
-                    let (mf, mb) = (mean(&fg), mean(&bg));
-                    (err(&fg, mf) + err(&bg, mb), " ▘▝▀▖▌▞▛".chars().nth(m).unwrap(), if fg.is_empty() { mb } else { mf }, mb)
-                }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, g, f, b)| (g, f, b)).unwrap());
+                let px: Vec<[f32; 3]> = (0..128u32).map(|i| {
+                    let (x, y) = (cx * 8 + i % 8, cy * 16 + i / 8);
+                    let (o, b) = (im.get_pixel(x, y).0, sharp.get_pixel(x, y).0);
+                    [0, 1, 2].map(|k| (o[k] as f32 + 0.45 * (o[k] as f32 - b[k] as f32)).clamp(0.0, 255.0))
+                }).collect();
+                let sums = |m: u128| { let (mut s, mut q, mut n) = ([0f32; 3], [0f32; 3], 0f32); for p in px.iter().enumerate().filter(|(i, _)| m >> i & 1 == 1).map(|x| x.1) { n += 1.0; for k in 0..3 { s[k] += p[k]; q[k] += p[k] * p[k]; } } (s, q, n) };
+                let (ts, tq, tn) = sums(!0);
+                self.cells.push(glyphs.iter().map(|&(c, m)| {
+                    let ((is, iq, n), mean) = (sums(m), |s: [f32; 3], n: f32| s.map(|v| v / n.max(1.0)));
+                    let (os, on) = ([0, 1, 2].map(|k| ts[k] - is[k]), tn - n);
+                    let (fg, bg) = (mean(is, n), mean(os, on));
+                    let err: f32 = (0..3).map(|k| iq[k] - is[k] * fg[k] + (tq[k] - iq[k]) - os[k] * bg[k]).sum();
+                    (err, c, if n == 0.0 { bg } else { fg }, bg)
+                }).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, c, f, b)| (c, f, b)).unwrap());
             } }
         }
         let col = |c: [f32; 3]| { let c = c.map(|v| v.round() as u8); if truecolor { Color::Rgb(c[0], c[1], c[2]) } else { Color::Indexed(16 + 36 * (c[0] as u16 * 5 / 255) as u8 + 6 * (c[1] as u16 * 5 / 255) as u8 + (c[2] as u16 * 5 / 255) as u8) } };
-        let (x0, y0) = (slot.x + (slot.width - self.w) / 2, slot.y + (slot.height - self.h) / 2);
+        let (x0, y0) = (slot.x + (slot.width - self.w.min(slot.width)) / 2, slot.y + (slot.height - self.h.min(slot.height)) / 2);
         for (i, (g, f, b)) in self.cells.iter().enumerate() {
             if let Some(c) = buf.cell_mut((x0 + i as u16 % self.w, y0 + i as u16 / self.w)) { c.set_char(*g).set_fg(col(*f)).set_bg(col(*b)); }
         }
