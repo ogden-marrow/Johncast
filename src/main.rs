@@ -10,7 +10,7 @@ mod player;
 #[serde(default)]
 struct Settings { podcasts: Vec<Podcast>, sync: bool, cookie: String }
 #[derive(Serialize, Deserialize, Default)]
-struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64> }
+struct Podcast { url: String, title: String, listened: Vec<String>, #[serde(default)] resume: Map<String, u64>, #[serde(default)] played: u64 }
 type Ep = (String, String, Option<String>, Option<String>, Option<String>);
 static INT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 struct Restore;
@@ -22,8 +22,11 @@ fn file() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap_or(format!("{home}/.config"))).join("johncast/settings.json")
 }
 fn load() -> Settings {
-    std::fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    let mut s: Settings = std::fs::read_to_string(file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    order(&mut s);
+    s
 }
+fn order(s: &mut Settings) { s.podcasts.sort_by_key(|p| std::cmp::Reverse(p.played)) }
 fn save(s: &Settings) {
     let f = file();
     let _ = std::fs::create_dir_all(f.parent().unwrap());
@@ -104,6 +107,7 @@ fn import(s: &mut Settings, feeds: Feeds) -> usize {
         }
     }
     s.podcasts.extend(old);
+    order(s);
     added
 }
 
@@ -249,7 +253,7 @@ fn main() -> std::io::Result<()> {
         } else if let Some((pi, list)) = &eps {
             if nav(&mut st, &mut typed, list.len(), code) { continue }
             match code {
-                K::Esc | K::Left | K::Char('q') => { st.select(Some(*pi)); eps = None; }
+                K::Esc | K::Left | K::Char('q') => { let u = s.podcasts[*pi].url.clone(); eps = None; order(&mut s); st.select(s.podcasts.iter().position(|p| p.url == u)); }
                 K::Char(' ') | K::Enter => if let Some((id, title, url, art, chapters)) = st.selected().and_then(|i| list.get(i)) {
                     let (play_it, p) = (code == K::Enter, &mut s.podcasts[*pi]);
                     if play_it && url.is_none() { msg = "No audio in this episode.".into(); continue }
@@ -262,6 +266,7 @@ fn main() -> std::io::Result<()> {
                     save(&s);
                     if let (true, Some(url)) = (play_it, url) {
                         let track = player::Track { title: title.clone(), show: s.podcasts[*pi].title.clone(), url: url.clone(), start, art: art.clone(), chapters: chapters.clone() };
+                        s.podcasts[*pi].played = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                         let pos = match player::play(&mut t, &picker, track) {
                             Ok(p) => p,
                             Err(e) => { msg = format!("Could not play: {e}"); continue }
